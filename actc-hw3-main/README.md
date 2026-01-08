@@ -119,7 +119,7 @@ curl -X PUT https://$ORCHESTRATOR/api/apps/v1/namespaces/default/replicasets/hea
             }
         }
     }'
-```
+``` 
 
 - The system continuously (every five seconds or less) reconciles actual resources with the configuration. If we were to manually delete one of the pods created by the `ReplicaSet` (or it were to naturally stop), soon a new one would be created to replace it.
 - Pods are in the same network and can access each other by name, e.g. in our example, running `curl http://ping:5000` from a `health` container will connect to port 5000 on the ping pod, running `curl http://health:2000` on the ping [`ping`](http://localhost:2000/health) will connect to port 5000 on a health pod chosen by the load balancer.
