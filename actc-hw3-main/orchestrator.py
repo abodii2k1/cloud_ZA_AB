@@ -1,26 +1,23 @@
 """
-Kubernetes-like orchestration system for Python threads.
+Kubernetes-like orchestration system for Podman containers.
 
 This implements:
-- Resource types: Pod, Service (strict subset of Kubernetes API)
+- Resource types: Pod, Service, ReplicaSet (strict subset of Kubernetes API)
 - Controllers for each resource type
 - In-memory resource tree
-- Inter-container communication via queues
+- Inter-container communication via Podman network
 - FastAPI REST API compatible with kubectl-style requests
 """
 
 import threading
-import queue
 import yaml
 import random
-import importlib
 import time
-import re
 import uvicorn
+import subprocess
+import json
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, field
-from concurrent.futures import Future
-from enum import Enum
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Path, Query
@@ -31,11 +28,6 @@ from pydantic import BaseModel
 # =============================================================================
 # Resource Definitions
 # =============================================================================
-
-
-class ResourceType(Enum):
-    POD = "pod"
-    SERVICE = "service"
 
 
 @dataclass
@@ -118,6 +110,14 @@ class PodResource(Resource):
     def labels(self) -> Dict[str, str]:
         return self.metadata
 
+    @property
+    def ports(self) -> List[Dict[str, Any]]:
+        """Extract ports from first container spec"""
+        container = self.first_container
+        if container:
+            return container.get("ports", [])
+        return []
+
 
 @dataclass
 class ServiceResource(Resource):
@@ -152,13 +152,75 @@ class ServiceResource(Resource):
         return self.spec.get("type", "ClusterIP")
 
 
+@dataclass
+class ReplicaSetResource(Resource):
+    """ReplicaSet resource definition"""
+
+    def __init__(
+        self,
+        name: str,
+        spec: Dict[str, Any],
+        metadata: Dict[str, Any] = None,
+        namespace: str = "default",
+    ):
+        super().__init__(
+            api_version="apps/v1",
+            kind="ReplicaSet",
+            name=name,
+            namespace=namespace,
+            spec=spec,
+            metadata=metadata or {},
+        )
+
+    @property
+    def replicas(self) -> int:
+        return self.spec.get("replicas", 1)
+
+    @property
+    def selector(self) -> Dict[str, str]:
+        return self.spec.get("selector", {})
+
+    @property
+    def template(self) -> Dict[str, Any]:
+        return self.spec.get("template", {})
+
+
 # =============================================================================
 # Container Runtime
 # =============================================================================
 
+# Podman helpers
+NETWORK_NAME = "orchestrator-network"
+
+def run_podman(args):
+    cmd = ["podman"] + args
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result
+
+def podman_inspect(container_id):
+    result = run_podman(["inspect", container_id])
+    if result.returncode == 0 and result.stdout.strip():
+        return json.loads(result.stdout)[0]
+    return None
+
+def setup_network():
+    """Create Podman network if it doesn't exist"""
+    result = run_podman(["network", "ls", "--format", "{{.Name}}"])
+    networks = result.stdout.strip().split("\n") if result.stdout.strip() else []
+
+    if NETWORK_NAME not in networks:
+        print(f"Creating network {NETWORK_NAME}")
+        run_podman(["network", "create", NETWORK_NAME])
+    else:
+        print(f"Network {NETWORK_NAME} already exists")
+
+def cleanup_network():
+    """Remove network"""
+    run_podman(["network", "rm", NETWORK_NAME])
+
 
 class Container:
-    """Running container (thread) instance"""
+    """Running Podman container instance"""
 
     def __init__(
         self,
@@ -167,59 +229,88 @@ class Container:
         env: Dict[str, Any],
         api_client: "OrchestratorAPI",
         labels: Dict[str, str] = None,
+        namespace: str = "default",
+        ports: List[Dict[str, Any]] = None,
+        network_aliases: List[str] = None
     ):
         self.name = name
+        self.namespace = namespace
         self.image = image
-        self.env = env
+        self.env = env or {}
         self.api_client = api_client
         self.labels = labels or {}
-        self.input_queue = queue.Queue()
-        self.thread = None
-        self.running = False
+        self.ports = ports or []
+        self.network_aliases = network_aliases or []
+        self.container_id = None
 
     def start(self):
-        """Start the container thread"""
-        if self.running:
+        """Start Podman container"""
+        if self.container_id:
             return
 
-        self.running = True
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
+        container_name = f"{self.namespace}-{self.name}"
+
+        # Clean up any existing container with the same name
+        run_podman(["rm", "-f", container_name])
+
+        cmd = ["run", "-d", "--name", container_name, "--network", NETWORK_NAME]
+
+        # Add network aliases for DNS resolution (e.g., "ping", "health-service")
+        for alias in self.network_aliases:
+            cmd.extend(["--network-alias", alias])
+
+        # Add port mappings (-p host:container or -p container)
+        for port_spec in self.ports:
+            container_port = port_spec.get("containerPort")
+            host_port = port_spec.get("hostPort")
+
+            if container_port:
+                if host_port:
+                    # Map host port to container port
+                    cmd.extend(["-p", f"{host_port}:{container_port}"])
+                else:
+                    # Just expose container port (Podman assigns random host port)
+                    cmd.extend(["-p", str(container_port)])
+
+        # add environment variables
+        for k, v in self.env.items():
+            cmd.extend(["-e", f"{k}={v}"])
+
+        # add labels
+        for k, v in self.labels.items():
+            cmd.extend(["--label", f"{k}={v}"])
+
+        cmd.append(self.image)
+
+        # for testing with alpine, add sleep infinity
+        if "alpine" in self.image.lower():
+            cmd.extend(["sleep", "infinity"])
+
+        result = run_podman(cmd)
+        if result.returncode == 0:
+            self.container_id = result.stdout.strip()
+            print(f"Started container {container_name}: {self.container_id[:12]}")
+        else:
+            print(f"Failed to start {container_name}: {result.stderr}")
 
     def stop(self):
-        """Stop the container thread"""
-        self.running = False
-        self.input_queue.put(None)  # Signal to stop
-        if self.thread:
-            self.thread.join(timeout=5)
+        """Stop Podman container"""
+        if not self.container_id:
+            return
 
-    def _run(self):
-        """Run the container function"""
-        try:
-            # Image format: module.function or just function (assumes workers module)
-            if "." in self.image:
-                module_name, function_name = self.image.rsplit(".", 1)
-            else:
-                module_name = "workers"
-                function_name = self.image
+        # Use -f to force stop and remove in one command
+        run_podman(["rm", "-f", self.container_id])
+        self.container_id = None
 
-            # Dynamically import the module and get the function
-            module = importlib.import_module(module_name)
-            func = getattr(module, function_name)
+    def is_running(self):
+        """Check if Podman container is running"""
+        if not self.container_id:
+            return False
 
-            # Run the function with env and input queue
-            func(
-                input_queue=self.input_queue,
-                api_client=self.api_client,
-                **self.env,
-            )
-        except Exception as e:
-            print(f"Container {self.name} error: {e}")
-            import traceback
-
-            traceback.print_exc()
-        finally:
-            self.running = False
+        info = podman_inspect(self.container_id)
+        if info:
+            return info.get("State", {}).get("Running", False)
+        return False
 
 
 # =============================================================================
@@ -234,6 +325,7 @@ class ResourceStore:
         self.resources: Dict[str, Dict[str, Dict[str, Resource]]] = {
             "Pod": {},  # namespace -> name -> resource
             "Service": {},
+            "ReplicaSet": {},
         }
         self.lock = threading.RLock()
 
@@ -372,21 +464,35 @@ class PodController(Controller):
                     self.containers[key].stop()
                     del self.containers[key]
 
-            # Create containers for new pods
+            # Create containers for new pods and check health of existing ones
             for key, pod in desired_pods.items():
                 if key not in self.containers:
                     print(f"Starting pod: {key}")
+                    # Add network alias as pod name (for DNS: http://ping:5000)
+                    network_aliases = [pod.name]
+
                     container = Container(
                         name=pod.name,
+                        namespace=pod.namespace,
                         image=pod.image,
                         env=pod.env,
                         api_client=self.api_client,
                         labels=pod.labels,
+                        ports=pod.ports,
+                        network_aliases=network_aliases,
                     )
                     container.start()
                     self.containers[key] = container
                     # Update pod status
-                    pod.status = {"phase": "Running"}
+                    pod.status = {"phase": "Running", "containerID": container.container_id}
+                else:
+                    # Check health of existing containers
+                    container = self.containers[key]
+                    if not container.is_running():
+                        print(f"Pod {key} died, restarting...")
+                        container.stop()
+                        container.start()
+                        pod.status = {"phase": "Running", "containerID": container.container_id}
 
     def get_container(
         self, name: str, namespace: str = "default"
@@ -424,23 +530,199 @@ class PodController(Controller):
 
 
 class ServiceController(Controller):
-    """Controller for Service resources - mainly for validation"""
+    """Controller for Service resources - creates load balancer containers"""
 
     def __init__(self, store: ResourceStore, pod_controller: PodController):
         super().__init__(store)
         self.pod_controller = pod_controller
+        self.lb_containers: Dict[str, Container] = {}  # "namespace/service-name" -> Container
+        self.lock = threading.RLock()
+
+    def _service_key(self, namespace: str, name: str) -> str:
+        return f"{namespace}/{name}"
 
     def reconcile(self):
-        """Validate service selectors"""
-        for service in self.store.list("Service"):
-            # Validate that the selector matches at least one pod
-            containers = self.pod_controller.get_containers_by_labels(
-                service.selector, service.namespace
-            )
-            if not containers:
-                print(
-                    f"Warning: Service {service.name} selector {service.selector} matches no pods"
+        """Create/update load balancer containers for services"""
+        with self.lock:
+            # Get all services
+            desired_services = {}
+            for service in self.store.list("Service"):
+                key = self._service_key(service.namespace, service.name)
+                desired_services[key] = service
+
+            # Stop and remove LB containers for deleted services
+            for key in list(self.lb_containers.keys()):
+                if key not in desired_services:
+                    print(f"Stopping service LB: {key}")
+                    self.lb_containers[key].stop()
+                    del self.lb_containers[key]
+
+            # Create or update LB containers for services
+            for key, service in desired_services.items():
+                # Check if service has backend pods
+                backend_containers = self.pod_controller.get_containers_by_labels(
+                    service.selector, service.namespace
                 )
+
+                if not backend_containers:
+                    print(f"Warning: Service {service.name} selector {service.selector} matches no pods")
+                    # Remove LB if no backends exist
+                    if key in self.lb_containers:
+                        self.lb_containers[key].stop()
+                        del self.lb_containers[key]
+                    continue
+
+                # Create LB container if it doesn't exist
+                if key not in self.lb_containers:
+                    self._create_lb_container(service, backend_containers)
+                else:
+                    # Check if LB is still running
+                    lb_container = self.lb_containers[key]
+                    if not lb_container.is_running():
+                        print(f"Service LB {key} died, restarting...")
+                        lb_container.stop()
+                        self._create_lb_container(service, backend_containers)
+
+    def _create_lb_container(self, service: ServiceResource, backend_containers: List[Container]):
+        """Create a load balancer container for a service"""
+        key = self._service_key(service.namespace, service.name)
+
+        if not service.ports:
+            print(f"Warning: Service {service.name} has no ports defined")
+            return
+
+        # Use first port spec for now (most services have one port)
+        port_spec = service.ports[0]
+        service_port = port_spec.get("port")
+        target_port = port_spec.get("targetPort", service_port)
+
+        # Build backend list using pod names (DNS-resolvable): pod1:8080,pod2:8080,...
+        backends = []
+        for container in backend_containers:
+            # Use pod name (network alias) instead of Podman container name
+            backends.append(f"{container.name}:{target_port}")
+
+        if not backends:
+            return
+
+        # Create LB container with environment variables
+        env = {
+            "SERVICE_NAME": service.name,
+            "SERVICE_PORT": str(service_port),
+            "BACKENDS": ",".join(backends),  # comma-separated list
+        }
+
+        lb_name = f"lb-{service.name}"
+        labels = {"component": "load-balancer", "service": service.name}
+
+        # Network alias = service name (for DNS: http://health-service:2000)
+        network_aliases = [service.name]
+
+        # Port mapping: expose service port to host and for in-cluster access
+        ports = [
+            {"containerPort": service_port, "hostPort": service_port}
+        ]
+
+        lb_container = Container(
+            name=lb_name,
+            namespace=service.namespace,
+            image="orchestrator-lb",  # Custom LB image (to be built)
+            env=env,
+            api_client=self.pod_controller.api_client,
+            labels=labels,
+            ports=ports,
+            network_aliases=network_aliases,
+        )
+
+        lb_container.start()
+        self.lb_containers[key] = lb_container
+        print(f"Created LB for service {key} (port {service_port}) with backends: {backends}")
+
+
+class ReplicaSetController(Controller):
+    """Controller for ReplicaSet resources"""
+
+    def __init__(self, store: ResourceStore):
+        super().__init__(store)
+        self.lock = threading.RLock()
+
+    def reconcile(self):
+        """Ensure desired number of pod replicas exist"""
+        with self.lock:
+            for replicaset in self.store.list("ReplicaSet"):
+                self._reconcile_replicaset(replicaset)
+
+    def _reconcile_replicaset(self, replicaset: ReplicaSetResource):
+        """Reconcile a single ReplicaSet"""
+        desired_replicas = replicaset.replicas
+        selector = replicaset.selector
+        namespace = replicaset.namespace
+
+        # Find all pods owned by this ReplicaSet
+        owned_pods = self._find_owned_pods(replicaset)
+        actual_replicas = len(owned_pods)
+
+        if actual_replicas < desired_replicas:
+            # CREATE new pods
+            num_to_create = desired_replicas - actual_replicas
+            for i in range(num_to_create):
+                self._create_pod_from_template(replicaset)
+                print(f"ReplicaSet {namespace}/{replicaset.name}: created pod ({actual_replicas + i + 1}/{desired_replicas})")
+
+        elif actual_replicas > desired_replicas:
+            # DELETE excess pods
+            num_to_delete = actual_replicas - desired_replicas
+            for pod in owned_pods[:num_to_delete]:
+                self.store.delete("Pod", pod.name, namespace)
+                print(f"ReplicaSet {namespace}/{replicaset.name}: deleted pod {pod.name} ({actual_replicas - num_to_delete}/{desired_replicas})")
+
+        # UPDATE ReplicaSet status
+        replicaset.status = {
+            "replicas": len(self._find_owned_pods(replicaset)),
+            "readyReplicas": len(self._find_owned_pods(replicaset)),
+        }
+
+    def _find_owned_pods(self, replicaset: ReplicaSetResource) -> List[PodResource]:
+        """Find pods owned by this ReplicaSet"""
+        all_pods = self.store.list("Pod", replicaset.namespace)
+        owned_pods = []
+
+        for pod in all_pods:
+            # Check if pod name starts with replicaset name
+            if pod.name.startswith(f"{replicaset.name}-"):
+                # Check if pod labels match selector
+                matches = all(pod.labels.get(k) == v for k, v in replicaset.selector.items())
+                if matches:
+                    owned_pods.append(pod)
+
+        return owned_pods
+
+    def _create_pod_from_template(self, replicaset: ReplicaSetResource):
+        """Create a new pod from ReplicaSet template"""
+        import string
+
+        # Generate unique name: <replicaset-name>-<random-5-chars>
+        suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
+        pod_name = f"{replicaset.name}-{suffix}"
+
+        # Extract pod spec from template
+        template = replicaset.template
+        pod_spec = template.get("spec", {})
+        template_metadata = template.get("metadata", {})
+
+        # Merge selector labels with template metadata
+        pod_metadata = {**template_metadata, **replicaset.selector}
+
+        # Create pod resource
+        pod = PodResource(
+            name=pod_name,
+            spec=pod_spec,
+            metadata=pod_metadata,
+            namespace=replicaset.namespace,
+        )
+
+        # Add to store
+        self.store.create_or_update(pod)
 
 
 # =============================================================================
@@ -449,75 +731,18 @@ class ServiceController(Controller):
 
 
 class OrchestratorAPI:
-    """API for interacting with containers"""
+    """
+    API for interacting with containers.
+
+    Note: With Podman-based containers using HTTP workers,
+    inter-container communication happens via HTTP requests
+    to service names (e.g., http://health-service:2000)
+    rather than in-process message queues.
+    """
 
     def __init__(self, pod_controller: PodController, store: ResourceStore):
         self.pod_controller = pod_controller
         self.store = store
-
-    def send_to_pod(
-        self,
-        pod_name: str,
-        value: Any,
-        namespace: str = "default",
-        expect_response: bool = False,
-    ) -> Optional[Future]:
-        """Send a value to a pod's container queue"""
-        container = self.pod_controller.get_container(pod_name, namespace)
-        if not container:
-            raise ValueError(f"Pod {namespace}/{pod_name} not found or not running")
-
-        if expect_response:
-            future = Future()
-            container.input_queue.put((value, future))
-            return future
-        else:
-            container.input_queue.put(value)
-            return None
-
-    def send_to_service(
-        self,
-        service_name: str,
-        value: Any,
-        namespace: str = "default",
-        expect_response: bool = False,
-        port: int = None,
-    ) -> Optional[Future]:
-        """Send a value to a random pod matched by the service"""
-        service = self.store.get("Service", service_name, namespace)
-        if not service:
-            raise ValueError(f"Service {namespace}/{service_name} not found")
-
-        # Find pods matching the service selector
-        containers = self.pod_controller.get_containers_by_labels(
-            service.selector, namespace
-        )
-
-        if not containers:
-            raise ValueError(f"No pods match service {service_name}")
-
-        # Random load balancing
-        container = random.choice(containers)
-
-        if expect_response:
-            future = Future()
-            container.input_queue.put((value, future))
-            return future
-        else:
-            container.input_queue.put(value)
-            return None
-
-    def resolve_service(self, service_ref: str, namespace: str = "default") -> tuple:
-        """Resolve a service reference like 'service-name:port' to (service, port)"""
-        if ":" in service_ref:
-            service_name, port = service_ref.rsplit(":", 1)
-            port = int(port)
-        else:
-            service_name = service_ref
-            port = None
-
-        service = self.store.get("Service", service_name, namespace)
-        return service, port
 
 
 # =============================================================================
@@ -532,6 +757,7 @@ class OrchestratorCluster:
         self.store = ResourceStore()
         self.pod_controller = None
         self.service_controller = None
+        self.replicaset_controller = None
         self.api = None
         self._started = False
 
@@ -540,6 +766,9 @@ class OrchestratorCluster:
         if self._started:
             return
 
+        # Setup Podman network
+        setup_network()
+
         # Initialize API
         self.pod_controller = PodController(self.store, None)
         self.api = OrchestratorAPI(self.pod_controller, self.store)
@@ -547,10 +776,12 @@ class OrchestratorCluster:
 
         # Initialize controllers
         self.service_controller = ServiceController(self.store, self.pod_controller)
+        self.replicaset_controller = ReplicaSetController(self.store)
 
         # Start controllers
         self.pod_controller.start()
         self.service_controller.start()
+        self.replicaset_controller.start()
 
         self._started = True
         print("Orchestrator cluster started")
@@ -561,6 +792,8 @@ class OrchestratorCluster:
             self.pod_controller.stop()
         if self.service_controller:
             self.service_controller.stop()
+        if self.replicaset_controller:
+            self.replicaset_controller.stop()
         self._started = False
         print("Orchestrator cluster stopped")
 
@@ -587,6 +820,8 @@ class OrchestratorCluster:
             resource = PodResource(name, spec, clean_metadata, ns)
         elif kind == "Service":
             resource = ServiceResource(name, spec, clean_metadata, ns)
+        elif kind == "ReplicaSet":
+            resource = ReplicaSetResource(name, spec, clean_metadata, ns)
         else:
             raise ValueError(f"Unknown resource kind: {kind}")
 
@@ -788,58 +1023,78 @@ async def delete_service(namespace: str, name: str):
 
 
 # =============================================================================
-# Messaging Endpoints (Extension to Kubernetes API)
+# ReplicaSet Endpoints
 # =============================================================================
 
 
-@app.post("/api/v1/namespaces/{namespace}/pods/{name}/send")
-async def send_to_pod(namespace: str, name: str, message: Dict[str, Any]):
-    """Send a message to a Pod"""
+@app.post("/api/apps/v1/namespaces/{namespace}/replicasets")
+async def create_replicaset(namespace: str, resource: ResourceRequest):
+    """Create a ReplicaSet"""
+    if resource.kind != "ReplicaSet":
+        raise HTTPException(400, f"Expected kind ReplicaSet, got {resource.kind}")
+
+    resource_dict = resource.model_dump()
+    resource_dict["metadata"]["namespace"] = namespace
+
     try:
-        cluster.api.send_to_pod(name, message.get("data"), namespace)
-        return {"status": "Success", "message": "Message sent"}
+        created = cluster.apply_resource(resource_dict, namespace)
+        return JSONResponse(status_code=201, content=resource_response(created))
     except ValueError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(400, str(e))
 
 
-@app.post("/api/v1/namespaces/{namespace}/pods/{name}/call")
-async def call_pod(namespace: str, name: str, message: Dict[str, Any]):
-    """Send a message to a Pod and wait for response"""
-    try:
-        future = cluster.api.send_to_pod(
-            name, message.get("data"), namespace, expect_response=True
-        )
-        result = future.result(timeout=message.get("timeout", 30))
-        return {"status": "Success", "result": result}
-    except ValueError as e:
-        raise HTTPException(404, str(e))
-    except TimeoutError:
-        raise HTTPException(408, "Request timeout")
+@app.get("/api/apps/v1/namespaces/{namespace}/replicasets")
+async def list_replicasets(namespace: str):
+    """List all ReplicaSets in a namespace"""
+    replicasets = cluster.list_resources("ReplicaSet", namespace)
+    return resources_list_response("ReplicaSet", replicasets)
 
 
-@app.post("/api/v1/namespaces/{namespace}/services/{name}/send")
-async def send_to_service(namespace: str, name: str, message: Dict[str, Any]):
-    """Send a message to a Service (load balanced to a pod)"""
-    try:
-        cluster.api.send_to_service(name, message.get("data"), namespace)
-        return {"status": "Success", "message": "Message sent"}
-    except ValueError as e:
-        raise HTTPException(404, str(e))
+@app.get("/api/apps/v1/namespaces/{namespace}/replicasets/{name}")
+async def get_replicaset(namespace: str, name: str):
+    """Get a specific ReplicaSet"""
+    rs = cluster.get_resource("ReplicaSet", name, namespace)
+    if not rs:
+        raise HTTPException(404, f"ReplicaSet {namespace}/{name} not found")
+    return resource_response(rs)
 
 
-@app.post("/api/v1/namespaces/{namespace}/services/{name}/call")
-async def call_service(namespace: str, name: str, message: Dict[str, Any]):
-    """Send a message to a Service and wait for response"""
-    try:
-        future = cluster.api.send_to_service(
-            name, message.get("data"), namespace, expect_response=True
-        )
-        result = future.result(timeout=message.get("timeout", 30))
-        return {"status": "Success", "result": result}
-    except ValueError as e:
-        raise HTTPException(404, str(e))
-    except TimeoutError:
-        raise HTTPException(408, "Request timeout")
+@app.delete("/api/apps/v1/namespaces/{namespace}/replicasets/{name}")
+async def delete_replicaset(namespace: str, name: str):
+    """Delete a ReplicaSet (cascade delete owned pods)"""
+    rs = cluster.get_resource("ReplicaSet", name, namespace)
+    if not rs:
+        raise HTTPException(404, f"ReplicaSet {namespace}/{name} not found")
+
+    # Find and delete owned pods
+    if cluster.replicaset_controller:
+        owned_pods = cluster.replicaset_controller._find_owned_pods(rs)
+        for pod in owned_pods:
+            cluster.store.delete("Pod", pod.name, namespace)
+
+    # Delete the ReplicaSet
+    if cluster.store.delete("ReplicaSet", name, namespace):
+        return {"status": "Success", "message": f"ReplicaSet {namespace}/{name} deleted"}
+
+    raise HTTPException(404, f"ReplicaSet {namespace}/{name} not found")
+
+
+@app.put("/api/apps/v1/namespaces/{namespace}/replicasets/{name}")
+async def update_replicaset(namespace: str, name: str, resource: ResourceRequest):
+    """Update a ReplicaSet"""
+    if resource.kind != "ReplicaSet":
+        raise HTTPException(400, f"Expected kind ReplicaSet, got {resource.kind}")
+
+    existing = cluster.get_resource("ReplicaSet", name, namespace)
+    if not existing:
+        raise HTTPException(404, f"ReplicaSet {namespace}/{name} not found")
+
+    resource_dict = resource.model_dump()
+    resource_dict["metadata"]["namespace"] = namespace
+    resource_dict["metadata"]["name"] = name
+
+    updated = cluster.apply_resource(resource_dict, namespace)
+    return resource_response(updated)
 
 
 # =============================================================================

@@ -210,7 +210,6 @@ We will review your code according to a subset of these aspects:
 
 This implicitly means the architecture is no less important than the implementation, because it will affect how testable, how robust and how flexible the code is, and if there is nowhere for bugs to hide, there will be no bugs.
 
-You’re allowed to use AI for code that runs inside containers you build for testing. You’re not allowed to use AI for code that is part of the orchestrator. **It’s easy for us to tell if you have used AI, and we will do a random check, and we will be forced to give you a 0 mark, so please don’t.** You are allowed to consult with AI over technical problems you encounter, but try googling the error message first, you’d be surprised at how effective it is\!
 
 # Assignment Timeline
 
